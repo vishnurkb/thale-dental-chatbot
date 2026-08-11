@@ -5,6 +5,7 @@ single port - the widget's API_URL is same-origin relative, so whichever port
 this ends up bound to (see run.py's free-port picker), the widget just works
 with no separate static server or hardcoded port to keep in sync."""
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -13,7 +14,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from chatbot.config import SITE_DIR
+from chatbot.config import SITE_DIR, CHROMA_DIR
 from chatbot.retrieval.retriever import retrieve
 from chatbot.llm.factory import get_llm_provider
 from chatbot.prompt import SYSTEM_PROMPT, build_context, postprocess_answer
@@ -21,17 +22,46 @@ from chatbot.prompt import SYSTEM_PROMPT, build_context, postprocess_answer
 WIDGET_DIR = Path(__file__).resolve().parent.parent / "widget"
 EMBED_JS_PATH = WIDGET_DIR / "embed.js"
 
-app = FastAPI(title="Thale Dental Chatbot")
+_sessions: dict[str, list[dict]] = defaultdict(list)
+MAX_HISTORY_TURNS = 6
+
+_llm_provider = None
+_llm_provider_error = None
+
+
+def get_provider():
+    """Lazy singleton - a bad/missing OPENROUTER_API_KEY (or other provider
+    misconfig) must not crash the whole app at import time (that would fail
+    the deploy outright on hosts like Render). Instead /chat reports a clear
+    error to the caller and the app stays up."""
+    global _llm_provider, _llm_provider_error
+    if _llm_provider is None and _llm_provider_error is None:
+        try:
+            _llm_provider = get_llm_provider()
+        except Exception as e:
+            _llm_provider_error = str(e)
+            print(f"[startup] LLM provider init failed: {e}")
+    return _llm_provider
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    get_provider()  # surface config errors immediately in the deploy logs
+    if SITE_DIR.exists() and not (CHROMA_DIR.exists() and any(CHROMA_DIR.iterdir())):
+        print("[startup] No vector index found - building it now...")
+        from chatbot.ingest.build_index import build_index
+        count = build_index()
+        print(f"[startup] Indexed {count} chunks.")
+    yield
+
+
+app = FastAPI(title="Thale Dental Chatbot", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-llm_provider = get_llm_provider()
-_sessions: dict[str, list[dict]] = defaultdict(list)
-MAX_HISTORY_TURNS = 6
 
 
 class ChatRequest(BaseModel):
@@ -50,7 +80,22 @@ def chat(req: ChatRequest) -> ChatResponse:
     if not message:
         return ChatResponse(reply="Please type a question.", sources=[])
 
-    hits = retrieve(message)
+    provider = get_provider()
+    if provider is None:
+        print(f"[chat] LLM provider unavailable: {_llm_provider_error}")
+        return ChatResponse(
+            reply="Sorry, the chatbot is temporarily unavailable. Please try again shortly.",
+            sources=[],
+        )
+
+    try:
+        hits = retrieve(message)
+    except Exception as e:
+        print(f"[chat] Retrieval error (index may be missing): {e}")
+        return ChatResponse(
+            reply="Sorry, the chatbot is temporarily unavailable. Please try again shortly.",
+            sources=[],
+        )
     context = build_context(hits)
 
     history = _sessions[req.session_id]
@@ -58,7 +103,7 @@ def chat(req: ChatRequest) -> ChatResponse:
     history = history[-MAX_HISTORY_TURNS * 2:]
 
     try:
-        answer = llm_provider.generate(SYSTEM_PROMPT, history, context)
+        answer = provider.generate(SYSTEM_PROMPT, history, context)
     except RuntimeError as e:
         print(f"[chat] LLM provider error: {e}")
         return ChatResponse(
