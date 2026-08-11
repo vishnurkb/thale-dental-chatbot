@@ -1,0 +1,2 @@
+cd "D:\Thale Dental wordpress"
+python -m http.server 8000 --directory site
